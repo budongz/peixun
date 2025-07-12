@@ -155,244 +155,288 @@ ws = pickle.load(open("./model/ws.pkl", "rb"))
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
-class ManualLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers=1, bidirectional=False, dropout=0.0):
-        super(ManualLSTM, self).__init__()
+class ResidualLSTMCell(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super(ResidualLSTMCell, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        
+        # 输入门参数
+        self.W_ii = nn.Parameter(torch.Tensor(hidden_size, input_size))
+        self.W_hi = nn.Parameter(torch.Tensor(hidden_size, hidden_size))
+        self.b_i = nn.Parameter(torch.Tensor(hidden_size))
+        
+        # 遗忘门参数
+        self.W_if = nn.Parameter(torch.Tensor(hidden_size, input_size))
+        self.W_hf = nn.Parameter(torch.Tensor(hidden_size, hidden_size))
+        self.b_f = nn.Parameter(torch.Tensor(hidden_size))
+        
+        # 候选记忆参数
+        self.W_ig = nn.Parameter(torch.Tensor(hidden_size, input_size))
+        self.W_hg = nn.Parameter(torch.Tensor(hidden_size, hidden_size))
+        self.b_g = nn.Parameter(torch.Tensor(hidden_size))
+        
+        # 输出门参数
+        self.W_io = nn.Parameter(torch.Tensor(hidden_size, input_size))
+        self.W_ho = nn.Parameter(torch.Tensor(hidden_size, hidden_size))
+        self.b_o = nn.Parameter(torch.Tensor(hidden_size))
+        
+        # 残差连接投影(当输入和隐藏维度不匹配时使用)
+        if input_size != hidden_size:
+            self.residual_proj = nn.Linear(input_size, hidden_size)
+        else:
+            self.register_parameter('residual_proj', None)
+        
+        self.reset_parameters()
+    
+    def reset_parameters(self):
+        # 使用Xavier初始化
+        for p in self.parameters():
+            if p.data.ndimension() >= 2:
+                nn.init.xavier_uniform_(p.data)
+            else:
+                nn.init.zeros_(p.data)
+    
+    def forward(self, x, hx=None):
+        if hx is None:
+            h_t = torch.zeros(x.size(0), self.hidden_size, dtype=x.dtype, device=x.device)
+            c_t = torch.zeros(x.size(0), self.hidden_size, dtype=x.dtype, device=x.device)
+        else:
+            h_t, c_t = hx
+        
+        # 残差连接
+        residual = x
+        if self.residual_proj is not None:
+            residual = self.residual_proj(residual)
+        
+        # 输入门
+        i_t = torch.sigmoid(F.linear(x, self.W_ii, self.b_i) + F.linear(h_t, self.W_hi))
+        
+        # 遗忘门
+        f_t = torch.sigmoid(F.linear(x, self.W_if, self.b_f) + F.linear(h_t, self.W_hf))
+        
+        # 候选记忆
+        g_t = torch.tanh(F.linear(x, self.W_ig, self.b_g) + F.linear(h_t, self.W_hg))
+        
+        # 输出门
+        o_t = torch.sigmoid(F.linear(x, self.W_io, self.b_o) + F.linear(h_t, self.W_ho))
+        
+        # 更新细胞状态
+        c_t = f_t * c_t + i_t * g_t
+        
+        # 更新隐藏状态(加入残差连接)
+        h_t = o_t * torch.tanh(c_t) + residual
+        
+        return h_t, c_t
+    
+class ResidualMultiLayerLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=1, dropout=0.0):
+        super(ResidualMultiLayerLSTM, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.bidirectional = bidirectional
         self.dropout = dropout
         
-        # 更稳定的参数初始化
-        for layer in range(num_layers):
-            for direction in ['forward', 'backward'] if bidirectional else ['forward']:
-                for gate in ['i', 'f', 'o', 'c']:
-                    # 输入变换权重
-                    W = torch.Tensor(input_size if layer == 0 else hidden_size * (2 if bidirectional else 1), 
-                                   hidden_size)
-                    U = torch.Tensor(hidden_size, hidden_size)
-                    
-                    # Xavier初始化
-                    nn.init.xavier_uniform_(W, gain=nn.init.calculate_gain('sigmoid'))
-                    nn.init.xavier_uniform_(U, gain=nn.init.calculate_gain('sigmoid'))
-                    
-                    # 遗忘门偏置初始化为1
-                    if gate == 'f':
-                        b = torch.ones(hidden_size)
-                    else:
-                        b = torch.zeros(hidden_size)
-                    
-                    self.register_parameter(f'{direction}_l{layer}_W_{gate}', nn.Parameter(W))
-                    self.register_parameter(f'{direction}_l{layer}_U_{gate}', nn.Parameter(U))
-                    self.register_parameter(f'{direction}_l{layer}_b_{gate}', nn.Parameter(b))
+        # 创建多层LSTM单元
+        self.lstm_layers = nn.ModuleList()
+        for i in range(num_layers):
+            input_dim = input_size if i == 0 else hidden_size
+            self.lstm_layers.append(ResidualLSTMCell(input_dim, hidden_size))
         
-        self.dropout_layer = nn.Dropout(dropout)
-        
-    def forward(self, x, hidden_states=None):
-        seq_len, batch_size, _ = x.size()
-        
-        if hidden_states is None:
-            h = torch.zeros(self.num_layers * (2 if self.bidirectional else 1), 
-                          batch_size, self.hidden_size, device=x.device)
-            c = torch.zeros_like(h)
+        # 层间dropout
+        if dropout > 0 and num_layers > 1:
+            self.dropout_layer = nn.Dropout(dropout)
         else:
-            h, c = hidden_states
+            self.dropout_layer = None
+    
+    def forward(self, x, hx=None):
+        batch_size, seq_len, _ = x.size()
         
+        # 初始化隐藏状态
+        if hx is None:
+            h_t = [torch.zeros(batch_size, self.hidden_size, device=x.device) 
+                   for _ in range(self.num_layers)]
+            c_t = [torch.zeros(batch_size, self.hidden_size, device=x.device) 
+                   for _ in range(self.num_layers)]
+        else:
+            h_t, c_t = hx
+        
+        # 存储所有时间步的输出
         layer_outputs = []
         
-        for layer in range(self.num_layers):
-            layer_input = x if layer == 0 else layer_outputs[layer-1]
-            
-            if self.dropout > 0 and layer > 0:
-                layer_input = self.dropout_layer(layer_input)
-            
-            if self.bidirectional:
-                # 前向
-                h_forward = h[layer*2]
-                c_forward = c[layer*2]
-                forward_output = self._lstm_step(layer_input, h_forward, c_forward, layer, 'forward')
-                
-                # 后向
-                h_backward = h[layer*2+1]
-                c_backward = c[layer*2+1]
-                backward_output = self._lstm_step(layer_input.flip(0), h_backward, c_backward, layer, 'backward')
-                backward_output = backward_output.flip(0)
-                
-                layer_output = torch.cat([forward_output, backward_output], dim=-1)
-                h_layer = torch.stack([forward_output[-1], backward_output[-1]])
-                c_layer = torch.stack([c_forward, c_backward])
-            else:
-                h_layer = h[layer]
-                c_layer = c[layer]
-                layer_output = self._lstm_step(layer_input, h_layer, c_layer, layer, 'forward')
-                h_layer = layer_output[-1].unsqueeze(0)
-                c_layer = c_layer.unsqueeze(0)
-            
-            # 添加残差连接 (从当前层的输入到输出)
-            if layer > 0:  # 从第二层开始添加残差连接
-                # 确保维度匹配
-                if layer_output.size(-1) != layer_input.size(-1):
-                    # 如果维度不匹配，使用线性投影
-                    residual = nn.Linear(layer_input.size(-1), layer_output.size(-1), device=x.device)(layer_input)
-                else:
-                    residual = layer_input
-                layer_output = layer_output + residual
-            
-            layer_outputs.append(layer_output)
-            
-            # 更新隐藏状态
-            if self.bidirectional:
-                h = torch.cat([h[:layer*2], h_layer, h[layer*2+2:]])
-                c = torch.cat([c[:layer*2], c_layer, c[layer*2+2:]])
-            else:
-                h = torch.cat([h[:layer], h_layer, h[layer+1:]])
-                c = torch.cat([c[:layer], c_layer, c[layer+1:]])
-        
-        return layer_outputs[-1], (h, c)
-    
-    def _lstm_step(self, x, h_prev, c_prev, layer, direction):
-        seq_len, batch_size, _ = x.size()
-        outputs = []
-        
         for t in range(seq_len):
-            x_t = x[t]
+            x_t = x[:, t, :]
             
-            # 获取参数
-            W_i = getattr(self, f'{direction}_l{layer}_W_i')
-            W_f = getattr(self, f'{direction}_l{layer}_W_f')
-            W_o = getattr(self, f'{direction}_l{layer}_W_o')
-            W_c = getattr(self, f'{direction}_l{layer}_W_c')
+            new_h_t = []
+            new_c_t = []
             
-            U_i = getattr(self, f'{direction}_l{layer}_U_i')
-            U_f = getattr(self, f'{direction}_l{layer}_U_f')
-            U_o = getattr(self, f'{direction}_l{layer}_U_o')
-            U_c = getattr(self, f'{direction}_l{layer}_U_c')
+            for layer in range(self.num_layers):
+                h_t[layer], c_t[layer] = self.lstm_layers[layer](
+                    x_t, (h_t[layer], c_t[layer]))
+                
+                # 更新下一层的输入
+                x_t = h_t[layer]
+                
+                # 应用dropout(除了最后一层)
+                if self.dropout_layer is not None and layer < self.num_layers - 1:
+                    x_t = self.dropout_layer(x_t)
+                
+                new_h_t.append(h_t[layer])
+                new_c_t.append(c_t[layer])
             
-            b_i = getattr(self, f'{direction}_l{layer}_b_i')
-            b_f = getattr(self, f'{direction}_l{layer}_b_f')
-            b_o = getattr(self, f'{direction}_l{layer}_b_o')
-            b_c = getattr(self, f'{direction}_l{layer}_b_c')
-            
-            # 更稳定的计算方式
-            i_t = torch.sigmoid((x_t @ W_i) + (h_prev @ U_i) + b_i)
-            f_t = torch.sigmoid((x_t @ W_f) + (h_prev @ U_f) + b_f)
-            o_t = torch.sigmoid((x_t @ W_o) + (h_prev @ U_o) + b_o)
-            c_tilde = torch.tanh((x_t @ W_c) + (h_prev @ U_c) + b_c)
-            
-            c_t = f_t * c_prev + i_t * c_tilde
-            h_t = o_t * torch.tanh(c_t)
-            
-            outputs.append(h_t)
-            h_prev = h_t
-            c_prev = c_t
+            h_t, c_t = new_h_t, new_c_t
+            layer_outputs.append(h_t[-1])  # 只保存最后一层的输出
         
-        return torch.stack(outputs)
+        # 将输出堆叠为 [batch_size, seq_len, hidden_size]
+        output = torch.stack(layer_outputs, dim=1)
+        
+        # 返回所有时间步的输出和最后的隐藏状态
+        return output, (h_t, c_t)
 
-class IMDBModel(nn.Module):
-    def __init__(self):
-        super(IMDBModel, self).__init__()
-        self.hidden_size = 64
-        self.embedding_dim = 200
-        self.num_layer = 2
-        self.bidirectional = True
-        self.bi_num = 2 if self.bidirectional else 1
-        self.dropout = 0.5
+class ResidualLSTMClassifier(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, hidden_size, num_layers, dropout=0.3):
+        super(ResidualLSTMClassifier, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=ws.PAD)
+        self.lstm = ResidualMultiLayerLSTM(embedding_dim, hidden_size, num_layers, dropout)
+        self.fc = nn.Linear(hidden_size, 2)  # 二分类
+        self.dropout = nn.Dropout(dropout)
         
-        # 限制embedding范围
-        self.embedding = nn.Embedding(len(ws), self.embedding_dim, padding_idx=ws.PAD)
-        nn.init.uniform_(self.embedding.weight, -0.1, 0.1)
-        
-        self.lstm = ManualLSTM(self.embedding_dim, self.hidden_size,
-                             num_layers=self.num_layer, 
-                             bidirectional=self.bidirectional,
-                             dropout=self.dropout)
-        
-        # 更稳定的输出层
-        self.fc = nn.Sequential(
-            nn.Linear(self.hidden_size * self.bi_num, 128),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(128, 2)
-        )
-
-    def forward(self, x):
-        x = self.embedding(x)
-        x = x.permute(1, 0, 2)
-        h_0, c_0 = self.init_hidden_state(x.size(1))
-        _, (h_n, c_n) = self.lstm(x, (h_0, c_0))
-        
-        if self.bidirectional:
-            out = torch.cat([h_n[-2, :, :], h_n[-1, :, :]], dim=-1)
+        # 嵌入层到输出的残差连接(当隐藏层大小和嵌入维度不同时)
+        if embedding_dim != hidden_size:
+            self.embedding_residual_proj = nn.Linear(embedding_dim, hidden_size)
         else:
-            out = h_n[-1, :, :]
-            
-        out = self.fc(out)
-        return F.log_softmax(out, dim=-1)
+            self.embedding_residual_proj = None
+        
+    def forward(self, x):
+        # 嵌入层
+        embedded = self.embedding(x)  # [batch_size, seq_len, embedding_dim]
+        
+        # LSTM层
+        lstm_out, _ = self.lstm(embedded)  # lstm_out: [batch_size, seq_len, hidden_size]
+        
+        # 嵌入层残差连接(对最后一个时间步)
+        if self.embedding_residual_proj is not None:
+            residual = self.embedding_residual_proj(embedded[:, -1, :])
+        else:
+            residual = embedded[:, -1, :]
+        
+        # 合并LSTM输出和残差连接
+        final_output = lstm_out[:, -1, :] + residual
+        
+        # 全连接层
+        out = self.fc(self.dropout(final_output))
+        return out
 
-    def init_hidden_state(self, batch_size):
-        h_0 = torch.zeros(self.num_layer * self.bi_num, batch_size, self.hidden_size).to(device)
-        c_0 = torch.zeros(self.num_layer * self.bi_num, batch_size, self.hidden_size).to(device)
-        return h_0, c_0
+# 模型参数
+vocab_size = len(ws)
+embedding_dim = 128
+hidden_size = 128
+num_layers = 2 
+dropout = 0.3
 
-# 初始化模型和优化器
-imdb_model = IMDBModel().to(device)
-optimizer = optim.Adam(imdb_model.parameters(), lr=0.0005, weight_decay=1e-4)
-criterion = nn.CrossEntropyLoss()
+model = ResidualLSTMClassifier(vocab_size, embedding_dim, hidden_size, num_layers, dropout).to(device)
 
-def train(epoch):
-    imdb_model.train()
-    train_dataloader = get_dataloader(train=True)
+
+# 训练函数
+def train(model, train_loader, optimizer, criterion, epoch):
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
     
-    for idx, (target, input) in enumerate(train_dataloader):
-        target = target.to(device)
-        input = input.to(device)
+    for batch_idx, (labels, texts) in enumerate(tqdm(train_loader, desc=f"Training Epoch {epoch}")):
+        labels, texts = labels.to(device), texts.to(device)
         
         optimizer.zero_grad()
-        output = imdb_model(input)
-        loss = F.nll_loss(output, target)
-        
-        # 梯度裁剪
-        torch.nn.utils.clip_grad_norm_(imdb_model.parameters(), max_norm=0.5)
-        
+        outputs = model(texts)
+        loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
         
-        if idx % 10 == 0:
-            print(f'Epoch {epoch} Batch {idx} Loss: {loss.item():.6f}')
-            
-            # 检查NaN
-            for name, param in imdb_model.named_parameters():
-                if torch.isnan(param).any():
-                    print(f"NaN in {name}")
-                    break
+        total_loss += loss.item()
+        _, predicted = torch.max(outputs.data, 1)
+        total += labels.size(0)
+        correct += (predicted == labels).sum().item()
+    
+    avg_loss = total_loss / len(train_loader)
+    accuracy = 100. * correct / total
+    return avg_loss, accuracy
 
-def test():
-    imdb_model.eval()
-    test_loss = 0
+# 测试函数
+def evaluate(model, test_loader, criterion):
+    model.eval()
+    total_loss = 0
     correct = 0
-    test_dataloader = get_dataloader(train=False)
+    total = 0
     
     with torch.no_grad():
-        for target, input in test_dataloader:
-            target = target.to(device)
-            input = input.to(device)
-            output = imdb_model(input)
-            test_loss += F.nll_loss(output, target, reduction='sum')
-            pred = output.argmax(dim=1)
-            correct += pred.eq(target).sum()
+        for labels, texts in tqdm(test_loader, desc="Evaluating"):
+            labels, texts = labels.to(device), texts.to(device)
+            outputs = model(texts)
+            loss = criterion(outputs, labels)
+            
+            total_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
     
-    test_loss /= len(test_dataloader.dataset)
-    accuracy = 100. * correct / len(test_dataloader.dataset)
-    print(f'\nTest set: Avg. loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_dataloader.dataset)} ({accuracy:.2f}%)\n')
+    avg_loss = total_loss / len(test_loader)
+    accuracy = 100. * correct / total
+    return avg_loss, accuracy
 
-if __name__ == '__main__':
-    # 训练和测试
-    test()
-    for i in range(3):
-        train(i)
-        print(f"训练第{i+1}轮的测试结果-----------------------------------------------------------------------------------------")
-        test()
+# 训练准备
+train_loader = get_dataloader(train=True)
+test_loader = get_dataloader(train=False)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.0005)
+
+# 训练循环
+num_epochs = 10
+train_losses = []
+train_accuracies = []
+test_losses = []
+test_accuracies = []
+
+for epoch in range(1, num_epochs + 1):
+    train_loss, train_acc = train(model, train_loader, optimizer, criterion, epoch)
+    test_loss, test_acc = evaluate(model, test_loader, criterion)
+    
+    train_losses.append(train_loss)
+    train_accuracies.append(train_acc)
+    test_losses.append(test_loss)
+    test_accuracies.append(test_acc)
+    
+    print(f'Epoch {epoch}:')
+    print(f'Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%')
+    print(f'Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}%')
+
+# 可视化训练过程
+plt.figure(figsize=(12, 5))
+
+# 损失曲线
+plt.subplot(1, 2, 1)
+plt.plot(train_losses, label='Train Loss')
+plt.plot(test_losses, label='Test Loss')
+plt.title('Training and Testing Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+
+# 准确率曲线
+plt.subplot(1, 2, 2)
+plt.plot(train_accuracies, label='Train Accuracy')
+plt.plot(test_accuracies, label='Test Accuracy')
+plt.title('Training and Testing Accuracy')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy (%)')
+plt.legend()
+
+plt.tight_layout()
+plt.savefig('model/manual_lstm_training_metrics.png')
+plt.show()
+
+print(f"Final Test Accuracy: {test_accuracies[-1]:.2f}%")

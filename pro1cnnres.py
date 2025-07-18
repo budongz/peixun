@@ -6,7 +6,11 @@ import torchvision
 import torchvision.transforms as transforms
 import numpy as np
 from torch.utils.data import DataLoader
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib
+matplotlib.use('Agg')  # 设置无头模式
+import matplotlib.pyplot as plt
+
 
 # 检查GPU可用性
 train_on_gpu = torch.cuda.is_available()
@@ -108,47 +112,45 @@ class ResNet(nn.Module):
 
 # 创建模型实例
 model = ResNet()
-model.to(device)  # 将模型移动到GPU（如果可用）
-aaaa
+model.to(device)
+
 # 定义损失函数和优化器
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=5e-4)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)  # 学习率调度器
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
 # 训练模型
 num_epochs = 20
+train_losses = []
+test_accuracies = []
 
 for epoch in range(num_epochs):
-    model.train()  # 设置为训练模式
+    model.train()
     running_loss = 0.0
+    epoch_loss = 0.0
     
     for i, data in enumerate(trainloader, 0):
         inputs, labels = data
         inputs, labels = inputs.to(device), labels.to(device)
         
-        # 清零梯度
         optimizer.zero_grad()
-        
-        # 前向传播
         outputs = model(inputs)
         loss = criterion(outputs, labels)
-        
-        # 反向传播和优化
         loss.backward()
         optimizer.step()
         
         running_loss += loss.item()
+        epoch_loss += loss.item()
         
-        # 每2000个batch打印一次统计信息
         if i % 2000 == 1999:
             print(f'Epoch [{epoch + 1}/{num_epochs}], Batch [{i + 1}/{len(trainloader)}], Loss: {running_loss / 2000:.3f}')
             running_loss = 0.0
     
-    # 调整学习率
+    train_losses.append(epoch_loss / len(trainloader))
     scheduler.step()
     
-    # 每个epoch结束后在测试集上评估
-    model.eval()  # 设置为评估模式
+    # 测试集评估
+    model.eval()
     correct = 0
     total = 0
     with torch.no_grad():
@@ -160,14 +162,18 @@ for epoch in range(num_epochs):
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
     
-    print(f'Epoch [{epoch + 1}/{num_epochs}] Test Accuracy: {100 * correct / total:.2f}%')
+    accuracy = 100 * correct / total
+    test_accuracies.append(accuracy)
+    print(f'Epoch [{epoch + 1}/{num_epochs}] Test Accuracy: {accuracy:.2f}%')
 
 print('Finished Training')
 
-# 在测试集上评估模型并输出每个类别的准确率
+# 评估模型
 model.eval()
 all_labels = []
 all_preds = []
+class_correct = [0] * 10
+class_total = [0] * 10
 
 with torch.no_grad():
     for data in testloader:
@@ -177,26 +183,75 @@ with torch.no_grad():
         _, predicted = torch.max(outputs.data, 1)
         all_labels.extend(labels.cpu().numpy())
         all_preds.extend(predicted.cpu().numpy())
-
-# 打印分类报告（包含每个类别的准确率）
-print("\nClassification Report:")
-print(classification_report(all_labels, all_preds, target_names=classes))
-
-# 计算并打印每个类别的准确率
-class_correct = [0] * 10
-class_total = [0] * 10
-
-with torch.no_grad():
-    for data in testloader:
-        images, labels = data
-        images, labels = images.to(device), labels.to(device)
-        outputs = model(images)
-        _, predicted = torch.max(outputs, 1)
+        
         c = (predicted == labels).squeeze()
         for i in range(len(labels)):
             label = labels[i]
             class_correct[label] += c[i].item()
             class_total[label] += 1
+
+# 1. 保存训练指标图
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.plot(train_losses, label='Training Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Training Loss Over Epochs')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(test_accuracies, label='Test Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy (%)')
+plt.title('Test Accuracy Over Epochs')
+plt.legend()
+plt.tight_layout()
+plt.savefig('resnet_training_metrics.png')
+plt.close()
+
+# 2. 保存样本预测图
+def imshow(img):
+    img = img / 2 + 0.5
+    npimg = img.numpy()
+    plt.imshow(np.transpose(npimg, (1, 2, 0)))
+    plt.axis('off')
+
+dataiter = iter(testloader)
+images, labels = next(dataiter)
+images, labels = images.to(device), labels.to(device)
+outputs = model(images)
+_, preds = torch.max(outputs, 1)
+images, labels, preds = images.cpu(), labels.cpu(), preds.cpu()
+
+plt.figure(figsize=(12, 8))
+for idx in range(12):
+    plt.subplot(3, 4, idx+1)
+    imshow(images[idx])
+    plt.title(f'True: {classes[labels[idx]]}\nPred: {classes[preds[idx]]}', fontsize=10)
+    plt.axis('off')
+plt.tight_layout()
+plt.savefig('resnet_sample_predictions.png')
+plt.close()
+
+# 3. 保存类别准确率图
+class_acc = [100 * class_correct[i] / class_total[i] for i in range(10)]
+plt.figure(figsize=(10, 5))
+plt.bar(classes, class_acc)
+plt.ylim(0, 100)
+plt.ylabel('Accuracy (%)')
+plt.title('ResNet Per-class Accuracy')
+plt.xticks(rotation=45)
+for i, acc in enumerate(class_acc):
+    plt.text(i, acc+1, f'{acc:.1f}%', ha='center')
+plt.tight_layout()
+plt.savefig('resnet_class_accuracy.png')
+plt.close()
+
+
+
+# 打印报告
+print("\nClassification Report:")
+print(classification_report(all_labels, all_preds, target_names=classes))
 
 print("\nPer-class Accuracy:")
 for i in range(10):

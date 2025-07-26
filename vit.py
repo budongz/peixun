@@ -1,4 +1,3 @@
-分析下面的代码，帮我该代码中用rearrange展开patch的方式改为用卷积的方式展开，维度不变，其他代码也不用变
 
 import torch
 
@@ -80,7 +79,7 @@ class FFN(nn.Module):
 
             nn.Linear(dim, hidden_dim),
 
-            nn.GELU(),
+            nn.ReLU(),
 
             nn.Dropout(dropout),
 
@@ -143,7 +142,7 @@ class ViT(nn.Module):
         patch_dim = channels * patch_height * patch_width
 
         self.to_patch_embedding = nn.Sequential(
-            
+
         nn.Conv2d(channels, dim, kernel_size=patch_size, stride=patch_size),
 
         Rearrange('b c h w -> b (h w) c'),  # 可选：用 einops 或 view
@@ -196,9 +195,9 @@ model = ViT(
 
     num_classes=10,
 
-    dim=128,  # 减小嵌入维度
+    dim=128,  # 嵌入维度
 
-    depth=12,   # 减少层数
+    depth=12,   # 层数
 
     heads=8,
 
